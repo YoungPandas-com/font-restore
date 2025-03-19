@@ -635,13 +635,16 @@ class Font_Protection_Plugin {
         <?php
     }
     
-    // NEW: Add a dedicated user protected files tab
+    /**
+     * Render user protected tab with improved UI
+     * Fixed to properly show thumbnails and avoid duplicate filenames
+     */
     public function render_user_protected_tab() {
         global $wpdb;
         
         // Get all user-protected files
         $query = "
-            SELECT p.ID, p.post_title, p.post_date, pm_offloaded.meta_value as is_offloaded
+            SELECT p.ID, p.post_title, p.post_date, p.post_mime_type, pm_offloaded.meta_value as is_offloaded
             FROM {$wpdb->posts} p
             JOIN {$wpdb->postmeta} pm_protected ON p.ID = pm_protected.post_id AND pm_protected.meta_key = 'fontprotect_user_protected' AND pm_protected.meta_value = '1'
             LEFT JOIN {$wpdb->postmeta} pm_offloaded ON p.ID = pm_offloaded.post_id AND pm_offloaded.meta_key = 'advmo_offloaded'
@@ -684,10 +687,10 @@ class Font_Protection_Plugin {
                             // Improved thumbnail display
                             $thumbnail = '';
                             if ($is_image) {
-                                // Try getting the thumbnail URL directly
-                                $thumb_url = wp_get_attachment_thumb_url($file->ID);
+                                // FIXED: Use proper WordPress thumbnail functions
+                                $thumb_url = wp_get_attachment_image_url($file->ID, 'thumbnail');
                                 if ($thumb_url) {
-                                    $thumbnail = '<img src="' . esc_url($thumb_url) . '" width="50" height="50" alt="' . esc_attr(basename($file_path)) . '" style="vertical-align: middle;" />';
+                                    $thumbnail = '<img src="' . esc_url($thumb_url) . '" width="50" height="50" alt="' . esc_attr(basename($file_path)) . '" style="vertical-align: middle; object-fit: cover;" />';
                                 } else {
                                     // Fallback to full image with resize
                                     $thumbnail = '<img src="' . esc_url($file_url) . '" width="50" height="50" alt="' . esc_attr(basename($file_path)) . '" style="vertical-align: middle; object-fit: cover;" />';
@@ -716,7 +719,9 @@ class Font_Protection_Plugin {
                             <tr>
                                 <td>
                                     <?php echo $thumbnail; ?>
-                                    <strong style="vertical-align: middle; margin-left: 10px;"><?php echo esc_html(basename($file_path)); ?></strong>
+                                    <strong style="vertical-align: middle; margin-left: 10px;">
+                                        <?php echo esc_html(basename($file_path)); ?>
+                                    </strong>
                                 </td>
                                 <td><?php echo strtoupper($file_type); ?></td>
                                 <td><?php echo get_the_date('', $file->ID); ?></td>
@@ -1801,6 +1806,7 @@ class Font_Protection_Plugin {
     
     /**
      * Download a font file from cloud storage
+     * Enhanced to also handle thumbnails properly
      */
     public function download_font_file($font_file) {
         // First, check if we have the minimum info needed
@@ -1854,6 +1860,11 @@ class Font_Protection_Plugin {
         
         // Update the metadata
         $this->update_font_metadata($font_file->ID);
+        
+        // ENHANCEMENT: Download thumbnails if this is an image
+        if (wp_attachment_is_image($font_file->ID)) {
+            $this->download_image_thumbnails($font_file->ID);
+        }
         
         return true;
     }
@@ -1976,6 +1987,11 @@ class Font_Protection_Plugin {
         
         // Update the metadata
         $this->update_font_metadata($font_file->ID);
+        
+        // ENHANCEMENT: Also download thumbnails if this is an image
+        if (wp_attachment_is_image($font_file->ID)) {
+            $this->download_image_thumbnails($font_file->ID);
+        }
         
         return true;
     }
@@ -2101,13 +2117,25 @@ class Font_Protection_Plugin {
             }
             
             // Update attachment metadata to trigger URL updates
-            $meta = wp_get_attachment_metadata($attachment_id);
-            if ($meta) {
-                wp_update_attachment_metadata($attachment_id, $meta);
+            $metadata = wp_get_attachment_metadata($attachment_id);
+            if ($metadata) {
+                wp_update_attachment_metadata($attachment_id, $metadata);
             }
             
-            // Let the offload plugin handle file management
-            // This ensures WordPress media library continues to function correctly
+            // ENHANCEMENT: If it's an image, clean up local thumbnails after ensuring cloud versions will be used
+            if (wp_attachment_is_image($attachment_id) && !empty($metadata['sizes'])) {
+                $upload_dir = wp_upload_dir();
+                $file_dir = dirname(get_attached_file($attachment_id));
+                
+                foreach ($metadata['sizes'] as $size => $size_info) {
+                    if (empty($size_info['file'])) continue;
+                    
+                    $thumb_path = $file_dir . '/' . $size_info['file'];
+                    if (file_exists($thumb_path)) {
+                        @unlink($thumb_path);
+                    }
+                }
+            }
             
             // SAFEGUARD: Refresh WordPress attachment cache
             clean_attachment_cache($attachment_id);
@@ -2741,12 +2769,26 @@ class Font_Protection_Plugin {
         
         if ($result === true) {
             $this->log('success', 'User Protected Download', $file_object->post_title, "Successfully downloaded to: {$file}");
+            
+            // ENHANCEMENT: Force regeneration of attachment metadata to refresh thumbnails
+            if (wp_attachment_is_image($attachment_id)) {
+                $metadata = wp_generate_attachment_metadata($attachment_id, $file);
+                wp_update_attachment_metadata($attachment_id, $metadata);
+            }
+            
             return true;
         } else {
             // Try alternative method
             $alt_result = $this->alt_download_font_file($file_object);
             if ($alt_result === true) {
                 $this->log('success', 'User Protected Alt Download', $file_object->post_title, "Used alternative method to download to: {$file}");
+                
+                // ENHANCEMENT: Force regeneration of attachment metadata for thumbnails
+                if (wp_attachment_is_image($attachment_id)) {
+                    $metadata = wp_generate_attachment_metadata($attachment_id, $file);
+                    wp_update_attachment_metadata($attachment_id, $metadata);
+                }
+                
                 return true;
             } else {
                 $this->log('error', 'User Protected Download Failed', $file_object->post_title, $alt_result);
@@ -2755,6 +2797,90 @@ class Font_Protection_Plugin {
         }
     }
 
+    /**
+     * Download all thumbnails for an image
+     * New function to ensure thumbnails are also saved locally
+     */
+    public function download_image_thumbnails($attachment_id) {
+        $metadata = wp_get_attachment_metadata($attachment_id);
+        
+        if (empty($metadata) || !isset($metadata['sizes'])) {
+            return false;
+        }
+        
+        $upload_dir = wp_upload_dir();
+        $base_dir = $upload_dir['basedir'];
+        $file_dir = dirname(get_attached_file($attachment_id));
+        
+        // Get original provider info for URL construction
+        $provider = get_post_meta($attachment_id, 'advmo_provider', true);
+        $bucket = get_post_meta($attachment_id, 'advmo_bucket', true);
+        $path = get_post_meta($attachment_id, 'advmo_path', true);
+        
+        // Process each thumbnail size
+        foreach ($metadata['sizes'] as $size => $size_info) {
+            if (empty($size_info['file'])) {
+                continue;
+            }
+            
+            // Construct the cloud URL for this thumbnail
+            $thumb_cloud_url = $this->get_thumbnail_cloud_url($attachment_id, $size_info['file'], $provider, $bucket, $path);
+            
+            if (!$thumb_cloud_url) {
+                $this->log('warning', 'Thumbnail Error', $size_info['file'], "Could not construct URL for thumbnail");
+                continue;
+            }
+            
+            // Construct the local path
+            $thumb_local_path = $file_dir . '/' . $size_info['file'];
+            
+            // Download the thumbnail
+            $response = wp_remote_get($thumb_cloud_url, [
+                'timeout' => 20,
+                'sslverify' => false,
+                'user-agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36'
+            ]);
+            
+            if (is_wp_error($response) || wp_remote_retrieve_response_code($response) !== 200) {
+                $this->log('warning', 'Thumbnail Download Failed', $size_info['file'], "Failed to download thumbnail");
+                continue;
+            }
+            
+            // Save the thumbnail
+            $result = file_put_contents($thumb_local_path, wp_remote_retrieve_body($response));
+            
+            if ($result) {
+                $this->log('success', 'Thumbnail Downloaded', $size_info['file'], "Saved thumbnail to: {$thumb_local_path}");
+            }
+        }
+        
+        // Update image metadata to refresh thumbnails 
+        wp_update_attachment_metadata($attachment_id, $metadata);
+        
+        return true;
+    }
+    
+    /**
+     * Get cloud URL for a thumbnail
+     * New function to get thumbnail URL from cloud storage
+     */
+    public function get_thumbnail_cloud_url($attachment_id, $thumb_filename, $provider, $bucket, $path) {
+        $main_file = basename(get_attached_file($attachment_id));
+        $main_cloud_url = $this->get_cloud_url((object)[
+            'ID' => $attachment_id,
+            'provider' => $provider,
+            'bucket' => $bucket, 
+            'path' => $path,
+            'guid' => get_the_guid($attachment_id)
+        ]);
+        
+        if (!$main_cloud_url) {
+            return false;
+        }
+        
+        // Replace the main filename with the thumbnail filename in the URL
+        return str_replace($main_file, $thumb_filename, $main_cloud_url);
+    }
 }
 
 // Initialize the plugin
