@@ -450,4 +450,156 @@
             }, 2000);
         });
     }
+
+    // Protection toggle in media library and protected files tab
+    $(document).on('click', '.fontprotect-toggle-protection', function(e) {
+        e.preventDefault();
+        
+        var $this = $(this);
+        var attachmentId = $this.data('id');
+        var action = $this.data('action');
+        
+        if (!attachmentId || !action) {
+            return;
+        }
+        
+        // Show loading state
+        $this.text(fontProtectData.i18n.loading);
+        $this.addClass('button-disabled');
+        
+        $.ajax({
+            url: fontProtectData.ajaxUrl,
+            type: 'POST',
+            data: {
+                action: 'fontprotect_toggle_protection',
+                nonce: fontProtectData.nonce,
+                attachment_id: attachmentId,
+                toggle_action: action
+            },
+            success: function(response) {
+                if (response.success) {
+                    // Show success message
+                    showMessage('success', response.data.message);
+                    
+                    // Update the UI
+                    if (action === 'protect') {
+                        $this.text('Protected!').addClass('button-primary');
+                        setTimeout(function() {
+                            // Reload the page to show updated status
+                            window.location.reload();
+                        }, 1500);
+                    } else {
+                        // Remove protection - this might be in the protected files tab
+                        if (window.location.href.indexOf('tab=protected') > -1) {
+                            // In protected files tab, remove the row
+                            $this.closest('tr').fadeOut(300, function() {
+                                $(this).remove();
+                                
+                                // If no more protected files, show the empty message
+                                if ($('.fontprotect-user-protected tbody tr').length === 0) {
+                                    $('.fontprotect-user-protected table').replaceWith(
+                                        '<div class="fontprotect-notice fontprotect-notice-info">' +
+                                        '<p>No user-protected files found. You can protect any media file from the media library.</p>' +
+                                        '<p><a href="' + fontProtectData.adminUrl + 'upload.php" class="button">Go to Media Library</a></p>' +
+                                        '</div>'
+                                    );
+                                }
+                            });
+                        } else {
+                            // In media library, update the UI
+                            window.location.reload();
+                        }
+                    }
+                } else {
+                    // Show error message
+                    showMessage('error', response.data.message);
+                    
+                    // Reset the button
+                    $this.text(action === 'protect' ? 'Protect' : 'Unprotect');
+                    $this.removeClass('button-disabled');
+                }
+            },
+            error: function() {
+                // Show error message
+                showMessage('error', 'An error occurred. Please try again.');
+                
+                // Reset the button
+                $this.text(action === 'protect' ? 'Protect' : 'Unprotect');
+                $this.removeClass('button-disabled');
+            }
+        });
+    });
+
+    // Restore specific file
+    $(document).on('click', '.fontprotect-restore-file', function(e) {
+        e.preventDefault();
+        
+        var $this = $(this);
+        var attachmentId = $this.data('id');
+        
+        if (!attachmentId) {
+            return;
+        }
+        
+        // Show loading state
+        $this.text(fontProtectData.i18n.loading);
+        $this.addClass('button-disabled');
+        
+        $.ajax({
+            url: fontProtectData.ajaxUrl,
+            type: 'POST',
+            data: {
+                action: 'fontprotect_restore_file',
+                nonce: fontProtectData.nonce,
+                attachment_id: attachmentId
+            },
+            success: function(response) {
+                if (response.success) {
+                    // Show success message
+                    showMessage('success', response.data.message);
+                    
+                    // Update the UI
+                    setTimeout(function() {
+                        window.location.reload();
+                    }, 1500);
+                } else {
+                    // Show error message
+                    showMessage('error', response.data.message);
+                    
+                    // Reset the button
+                    $this.text('Restore');
+                    $this.removeClass('button-disabled');
+                }
+            },
+            error: function() {
+                // Show error message
+                showMessage('error', 'An error occurred. Please try again.');
+                
+                // Reset the button
+                $this.text('Restore');
+                $this.removeClass('button-disabled');
+            }
+        });
+    });
+
+    // Add notifications for bulk actions results
+    $(document).ready(function() {
+        var urlParams = new URLSearchParams(window.location.search);
+        
+        // Check for bulk protect action results
+        if (urlParams.has('fontprotect_protected')) {
+            var count = urlParams.get('fontprotect_protected');
+            if (count > 0) {
+                showMessage('success', count + ' ' + (count === '1' ? 'file' : 'files') + ' protected successfully.');
+            }
+        }
+        
+        // Check for bulk unprotect action results
+        if (urlParams.has('fontprotect_unprotected')) {
+            var count = urlParams.get('fontprotect_unprotected');
+            if (count > 0) {
+                showMessage('success', count + ' ' + (count === '1' ? 'file' : 'files') + ' no longer protected.');
+            }
+        }
+    });
 })(jQuery);

@@ -36,7 +36,8 @@ define('FONTPROTECT_ASSETS_URL', FONTPROTECT_PLUGIN_URL . 'assets/');
 class Font_Protection_Plugin {
     // Define font extensions to protect - now including SVG
     private $font_extensions = ['ttf', 'woff', 'woff2', 'eot', 'otf', 'svg'];
-    
+    private $user_protected_files = []; // Will store IDs of user-protected files
+
     // Logging levels
     private $log_levels = [
         'info' => 'Information',
@@ -77,7 +78,7 @@ class Font_Protection_Plugin {
         register_deactivation_hook(__FILE__, [$this, 'deactivate']);
         
         // Fix URLs - But ONLY for font files, not all media
-        add_filter('wp_get_attachment_url', [$this, 'fix_font_url'], 9999, 2);
+        add_filter('wp_get_attachment_url', [$this, 'fix_media_url'], 9999, 2);
         
         // Direct fix for page builder fonts
         add_filter('elementor/font/font_face_src_url', [$this, 'fix_elementor_font_face_url'], 10, 2);
@@ -92,15 +93,37 @@ class Font_Protection_Plugin {
         add_action('wp_ajax_fontprotect_force_restore', [$this, 'ajax_force_restore']);
         add_action('wp_ajax_fontprotect_clear_cache', [$this, 'ajax_clear_cache']);
         add_action('wp_ajax_fontprotect_export_logs', [$this, 'ajax_export_logs']);
-        
+        // Add this to the constructor
+        add_action('wp_ajax_fontprotect_dismiss_notice', [$this, 'ajax_dismiss_notice']);
+
+        // NEW: Add AJAX handler for toggling protection status
+        add_action('wp_ajax_fontprotect_toggle_protection', [$this, 'ajax_toggle_protection']);
+        // Add this to the constructor of the Font_Protection_Plugin class
+        add_action('wp_ajax_fontprotect_restore_file', [$this, 'ajax_restore_file']);
+
         // Prevent font files from being reoffloaded
-        add_filter('advmo_should_offload_attachment', [$this, 'prevent_font_reoffload'], 9999, 2);
+        add_filter('advmo_should_offload_attachment', [$this, 'prevent_reoffload'], 9999, 2);
         
         // Add CSS fix in head - but only for fonts
         add_action('wp_head', [$this, 'add_font_css_fix'], 999);
         
         // Track uploads to only scan when needed
         add_action('add_attachment', [$this, 'track_upload']);
+        
+        // NEW: Add protection option to media library
+        add_filter('attachment_fields_to_edit', [$this, 'add_protection_field'], 10, 2);
+        add_filter('attachment_fields_to_save', [$this, 'save_protection_field'], 10, 2);
+        
+        // NEW: Add bulk action to media library
+        add_filter('bulk_actions-upload', [$this, 'add_bulk_protection_action']);
+        add_filter('handle_bulk_actions-upload', [$this, 'handle_bulk_protection_action'], 10, 3);
+        
+        // NEW: Add media list column
+        add_filter('manage_media_columns', [$this, 'add_protection_column']);
+        add_action('manage_media_custom_column', [$this, 'display_protection_column'], 10, 2);
+        
+        // Load user protected files on init
+        add_action('init', [$this, 'load_user_protected_files']);
     }
     
     /**
@@ -254,8 +277,8 @@ class Font_Protection_Plugin {
      * Enqueue admin assets
      */
     public function enqueue_admin_assets($hook) {
-        // Only load on our admin page
-        if ($hook != 'tools_page_font-protection') {
+        // Only load on our admin page or media library
+        if ($hook != 'tools_page_font-protection' && $hook != 'upload.php' && $hook != 'post.php') {
             return;
         }
         
@@ -279,17 +302,76 @@ class Font_Protection_Plugin {
         // Add localized script data
         wp_localize_script('fontprotect-admin-js', 'fontProtectData', [
             'ajaxUrl' => admin_url('admin-ajax.php'),
+            'adminUrl' => admin_url(),
             'nonce' => wp_create_nonce('fontprotect-admin'),
             'i18n' => [
                 'confirmRestore' => __('Are you sure you want to restore all font files? This may take a moment.', 'font-protection'),
                 'confirmClearCache' => __('Are you sure you want to clear the WordPress cache?', 'font-protection'),
                 'success' => __('Success!', 'font-protection'),
                 'error' => __('Error:', 'font-protection'),
-                'loading' => __('Processing...', 'font-protection')
+                'loading' => __('Processing...', 'font-protection'),
+                'protect' => __('Protect', 'font-protection'),
+                'unprotect' => __('Unprotect', 'font-protection'),
+                'restore' => __('Restore', 'font-protection')
             ]
         ]);
+        
+        // Add Media Library notice
+        if ($hook == 'upload.php') {
+            add_action('admin_notices', [$this, 'show_media_library_notice']);
+        }
     }
     
+
+    // NEW: Add a dismissible notice to the media library to inform users about the protection feature
+    public function show_media_library_notice() {
+        // Check if the notice has been dismissed
+        $dismissed = get_user_meta(get_current_user_id(), 'fontprotect_media_notice_dismissed', true);
+        if ($dismissed) {
+            return;
+        }
+        
+        ?>
+        <div class="notice notice-info is-dismissible fontprotect-media-notice" id="fontprotect-media-notice">
+            <p>
+                <strong><?php _e('Media Protection Available:', 'font-protection'); ?></strong>
+                <?php _e('You can now protect any media file from being offloaded to cloud storage. Look for the "Local Protection" column, or use bulk actions to protect multiple files.', 'font-protection'); ?>
+                <a href="<?php echo admin_url('tools.php?page=font-protection&tab=protected'); ?>"><?php _e('Learn More', 'font-protection'); ?></a>
+            </p>
+            <button type="button" class="notice-dismiss" id="fontprotect-dismiss-notice">
+                <span class="screen-reader-text"><?php _e('Dismiss this notice.', 'font-protection'); ?></span>
+            </button>
+        </div>
+        <script>
+            jQuery(document).ready(function($) {
+                $('#fontprotect-dismiss-notice').on('click', function() {
+                    $.ajax({
+                        url: ajaxurl,
+                        type: 'POST',
+                        data: {
+                            action: 'fontprotect_dismiss_notice',
+                            nonce: fontProtectData.nonce
+                        }
+                    });
+                });
+            });
+        </script>
+        <?php
+    }
+
+    // NEW: Add AJAX handler for dismissing the media library notice
+    public function ajax_dismiss_notice() {
+        // Check nonce
+        if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'fontprotect-admin')) {
+            wp_send_json_error();
+        }
+        
+        // Update user meta
+        update_user_meta(get_current_user_id(), 'fontprotect_media_notice_dismissed', true);
+        
+        wp_send_json_success();
+    }
+
     /**
      * Add admin notice
      */
@@ -351,10 +433,11 @@ class Font_Protection_Plugin {
         
         ?>
         <div class="wrap fontprotect-wrap">
-            <h1><?php _e('Font Protection for Media Offloader', 'font-protection'); ?></h1>
+            <h1><?php _e('Media Protection for WordPress', 'font-protection'); ?></h1>
             
             <nav class="nav-tab-wrapper">
                 <a href="<?php echo admin_url('tools.php?page=font-protection&tab=dashboard'); ?>" class="nav-tab <?php echo $current_tab === 'dashboard' ? 'nav-tab-active' : ''; ?>"><?php _e('Dashboard', 'font-protection'); ?></a>
+                <a href="<?php echo admin_url('tools.php?page=font-protection&tab=protected'); ?>" class="nav-tab <?php echo $current_tab === 'protected' ? 'nav-tab-active' : ''; ?>"><?php _e('Protected Files', 'font-protection'); ?></a>
                 <a href="<?php echo admin_url('tools.php?page=font-protection&tab=logs'); ?>" class="nav-tab <?php echo $current_tab === 'logs' ? 'nav-tab-active' : ''; ?>"><?php _e('Activity Logs', 'font-protection'); ?></a>
                 <a href="<?php echo admin_url('tools.php?page=font-protection&tab=settings'); ?>" class="nav-tab <?php echo $current_tab === 'settings' ? 'nav-tab-active' : ''; ?>"><?php _e('Settings', 'font-protection'); ?></a>
                 <a href="<?php echo admin_url('tools.php?page=font-protection&tab=tools'); ?>" class="nav-tab <?php echo $current_tab === 'tools' ? 'nav-tab-active' : ''; ?>"><?php _e('Tools', 'font-protection'); ?></a>
@@ -364,6 +447,9 @@ class Font_Protection_Plugin {
                 <?php
                 // Load the appropriate tab content
                 switch ($current_tab) {
+                    case 'protected':
+                        $this->render_user_protected_tab();
+                        break;
                     case 'logs':
                         $this->render_logs_tab();
                         break;
@@ -395,7 +481,7 @@ class Font_Protection_Plugin {
         
         // Show success message
         if (isset($_GET['restored']) && $_GET['restored'] === '1') {
-            echo '<div class="notice notice-success is-dismissible"><p>' . __('Font files have been restored successfully!', 'font-protection') . '</p></div>';
+            echo '<div class="notice notice-success is-dismissible"><p>' . __('Files have been restored successfully!', 'font-protection') . '</p></div>';
         }
         
         if (isset($_GET['cache_cleared']) && $_GET['cache_cleared'] === '1') {
@@ -446,10 +532,28 @@ class Font_Protection_Plugin {
                         </div>
                     </div>
                 </div>
+                
+                <!-- NEW: User Protected Files Statistics -->
+                <div class="fontprotect-stat-card">
+                    <div class="fontprotect-stat-icon dashicons dashicons-lock"></div>
+                    <div class="fontprotect-stat-content">
+                        <h3><?php _e('User Protected Files', 'font-protection'); ?></h3>
+                        <div class="fontprotect-stat-number"><?php echo $stats['user_protected_total']; ?></div>
+                    </div>
+                </div>
+                
+                <div class="fontprotect-stat-card <?php echo $stats['user_protected_offloaded'] > 0 ? 'fontprotect-warning' : ''; ?>">
+                    <div class="fontprotect-stat-icon dashicons dashicons-warning"></div>
+                    <div class="fontprotect-stat-content">
+                        <h3><?php _e('Pending User Files', 'font-protection'); ?></h3>
+                        <div class="fontprotect-stat-number"><?php echo $stats['user_protected_offloaded']; ?></div>
+                    </div>
+                </div>
             </div>
             
             <div class="fontprotect-dashboard-actions">
-                <a href="<?php echo wp_nonce_url(admin_url('tools.php?page=font-protection&action=restore'), 'fontprotect_restore'); ?>" class="button button-primary"><?php _e('Restore All Font Files Now', 'font-protection'); ?></a>
+                <a href="<?php echo wp_nonce_url(admin_url('tools.php?page=font-protection&action=restore'), 'fontprotect_restore'); ?>" class="button button-primary"><?php _e('Restore All Protected Files', 'font-protection'); ?></a>
+                <a href="<?php echo admin_url('upload.php'); ?>" class="button button-secondary"><?php _e('Manage Protected Files', 'font-protection'); ?></a>
                 <a href="<?php echo wp_nonce_url(admin_url('tools.php?page=font-protection&action=clear_cache'), 'fontprotect_clear_cache'); ?>" class="button button-secondary"><?php _e('Clear WordPress Cache', 'font-protection'); ?></a>
             </div>
             
@@ -493,24 +597,125 @@ class Font_Protection_Plugin {
                 </div>
             <?php endif; ?>
             
+            <!-- NEW: User Protected Files Information Section -->
+            <div class="fontprotect-card">
+                <h2><?php _e('User Protected Files', 'font-protection'); ?></h2>
+                <div>
+                    <p><?php _e('You can protect any media file from being offloaded to cloud storage by marking it as "Protected" in the media library.', 'font-protection'); ?></p>
+                    
+                    <h3><?php _e('How to Protect Media Files', 'font-protection'); ?></h3>
+                    <ol>
+                        <li><?php _e('Go to the Media Library', 'font-protection'); ?></li>
+                        <li><?php _e('Select a file to edit', 'font-protection'); ?></li>
+                        <li><?php _e('Check the "Keep file on local server" option', 'font-protection'); ?></li>
+                        <li><?php _e('Update the file', 'font-protection'); ?></li>
+                    </ol>
+                    
+                    <p><?php _e('You can also use the bulk actions to protect multiple files at once.', 'font-protection'); ?></p>
+                    
+                    <p><a href="<?php echo admin_url('upload.php'); ?>" class="button"><?php _e('Go to Media Library', 'font-protection'); ?></a></p>
+                </div>
+            </div>
+            
             <div class="fontprotect-card fontprotect-how-it-works">
                 <h2><?php _e('How This Plugin Works', 'font-protection'); ?></h2>
                 <div class="fontprotect-how-it-works-content">
-                    <p><?php _e('This plugin takes a proactive approach to font protection:', 'font-protection'); ?></p>
+                    <p><?php _e('This plugin takes a proactive approach to file protection:', 'font-protection'); ?></p>
                     <ol>
-                        <li><?php _e('It scans for font files that have been offloaded to cloud storage', 'font-protection'); ?></li>
-                        <li><?php _e('When it finds an offloaded font file, it downloads it back to your server', 'font-protection'); ?></li>
+                        <li><?php _e('It scans for font files and user-protected files that have been offloaded to cloud storage', 'font-protection'); ?></li>
+                        <li><?php _e('When it finds an offloaded file, it downloads it back to your server', 'font-protection'); ?></li>
                         <li><?php _e('It then modifies the URLs to ensure your site uses the local copy', 'font-protection'); ?></li>
                         <li><?php _e('This process runs automatically at regular intervals', 'font-protection'); ?></li>
                         <li><?php _e('Special hooks for Elementor and Bricks Builder ensure compatibility with these page builders', 'font-protection'); ?></li>
                     </ol>
-                    <p><strong><?php _e('Note:', 'font-protection'); ?></strong> <?php _e('This plugin does not prevent the initial offloading. Instead, it actively restores font files after they\'ve been offloaded.', 'font-protection'); ?></p>
+                    <p><strong><?php _e('Note:', 'font-protection'); ?></strong> <?php _e('This plugin does not prevent the initial offloading. Instead, it actively restores protected files after they\'ve been offloaded.', 'font-protection'); ?></p>
                 </div>
             </div>
         </div>
         <?php
     }
     
+    // NEW: Add a dedicated user protected files tab
+    public function render_user_protected_tab() {
+        global $wpdb;
+        
+        // Get all user-protected files
+        $query = "
+            SELECT p.ID, p.post_title, p.post_date, pm_offloaded.meta_value as is_offloaded
+            FROM {$wpdb->posts} p
+            JOIN {$wpdb->postmeta} pm_protected ON p.ID = pm_protected.post_id AND pm_protected.meta_key = 'fontprotect_user_protected' AND pm_protected.meta_value = '1'
+            LEFT JOIN {$wpdb->postmeta} pm_offloaded ON p.ID = pm_offloaded.post_id AND pm_offloaded.meta_key = 'advmo_offloaded'
+            WHERE p.post_type = 'attachment'
+            ORDER BY p.post_date DESC
+        ";
+        
+        $protected_files = $wpdb->get_results($query);
+        
+        ?>
+        <div class="fontprotect-user-protected">
+            <h2><?php _e('User Protected Files', 'font-protection'); ?></h2>
+            
+            <?php if (empty($protected_files)): ?>
+                <div class="fontprotect-notice fontprotect-notice-info">
+                    <p><?php _e('No user-protected files found. You can protect any media file from the media library.', 'font-protection'); ?></p>
+                    <p><a href="<?php echo admin_url('upload.php'); ?>" class="button"><?php _e('Go to Media Library', 'font-protection'); ?></a></p>
+                </div>
+            <?php else: ?>
+                <p><?php _e('These files are protected from being offloaded to cloud storage.', 'font-protection'); ?></p>
+                
+                <table class="widefat striped">
+                    <thead>
+                        <tr>
+                            <th><?php _e('File', 'font-protection'); ?></th>
+                            <th><?php _e('Type', 'font-protection'); ?></th>
+                            <th><?php _e('Date', 'font-protection'); ?></th>
+                            <th><?php _e('Status', 'font-protection'); ?></th>
+                            <th><?php _e('Actions', 'font-protection'); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($protected_files as $file): ?>
+                            <?php 
+                            $file_url = wp_get_attachment_url($file->ID);
+                            $file_path = get_attached_file($file->ID);
+                            $file_type = wp_check_filetype(basename($file_path))['ext'];
+                            $is_image = wp_attachment_is_image($file->ID);
+                            $thumbnail = $is_image ? wp_get_attachment_image($file->ID, [50, 50]) : '';
+                            $status = file_exists($file_path) ? 'protected' : 'missing';
+                            $status_text = $status === 'protected' ? __('Protected', 'font-protection') : __('Missing', 'font-protection');
+                            $status_class = $status === 'protected' ? 'fontprotect-status-active' : 'fontprotect-status-inactive';
+                            ?>
+                            <tr>
+                                <td>
+                                    <?php if ($thumbnail): ?>
+                                        <?php echo $thumbnail; ?>
+                                    <?php endif; ?>
+                                    <strong><?php echo esc_html(basename($file_path)); ?></strong>
+                                </td>
+                                <td><?php echo strtoupper($file_type); ?></td>
+                                <td><?php echo get_the_date('', $file->ID); ?></td>
+                                <td><span class="fontprotect-status <?php echo $status_class; ?>"><?php echo $status_text; ?></span></td>
+                                <td>
+                                    <a href="<?php echo esc_url(get_edit_post_link($file->ID)); ?>" class="button button-small"><?php _e('Edit', 'font-protection'); ?></a>
+                                    <a href="#" class="button button-small fontprotect-toggle-protection" data-id="<?php echo esc_attr($file->ID); ?>" data-action="unprotect"><?php _e('Unprotect', 'font-protection'); ?></a>
+                                    <?php if ($status === 'missing'): ?>
+                                        <a href="#" class="button button-small fontprotect-restore-file" data-id="<?php echo esc_attr($file->ID); ?>"><?php _e('Restore', 'font-protection'); ?></a>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+                
+                <div class="fontprotect-actions" style="margin-top: 20px;">
+                    <a href="<?php echo admin_url('upload.php'); ?>" class="button button-primary"><?php _e('Manage in Media Library', 'font-protection'); ?></a>
+                    <a href="<?php echo wp_nonce_url(admin_url('tools.php?page=font-protection&action=restore'), 'fontprotect_restore'); ?>" class="button"><?php _e('Force Restore All', 'font-protection'); ?></a>
+                </div>
+            <?php endif; ?>
+        </div>
+        <?php
+    }
+
     /**
      * Render logs tab
      */
@@ -943,7 +1148,7 @@ class Font_Protection_Plugin {
         
         $extensions_list = "'" . implode("','", $this->font_extensions) . "'";
         
-        // Get total count
+        // Get total font count
         $total_query = "
             SELECT COUNT(p.ID)
             FROM {$wpdb->posts} p
@@ -953,10 +1158,10 @@ class Font_Protection_Plugin {
             )
         ";
         
-        $total = (int)$wpdb->get_var($total_query);
+        $total_fonts = (int)$wpdb->get_var($total_query);
         
-        // Get offloaded count
-        $offloaded_query = "
+        // Get offloaded font count
+        $offloaded_fonts_query = "
             SELECT COUNT(p.ID)
             FROM {$wpdb->posts} p
             JOIN {$wpdb->postmeta} pm_offloaded ON p.ID = pm_offloaded.post_id AND pm_offloaded.meta_key = 'advmo_offloaded' AND pm_offloaded.meta_value = '1'
@@ -971,10 +1176,10 @@ class Font_Protection_Plugin {
             )
         ";
         
-        $offloaded = (int)$wpdb->get_var($offloaded_query);
+        $offloaded_fonts = (int)$wpdb->get_var($offloaded_fonts_query);
         
-        // Get protected count
-        $protected_query = "
+        // Get protected font count
+        $protected_fonts_query = "
             SELECT COUNT(p.ID)
             FROM {$wpdb->posts} p
             JOIN {$wpdb->postmeta} pm_provider ON p.ID = pm_provider.post_id AND pm_provider.meta_key = 'advmo_provider' AND pm_provider.meta_value = 'fontprotect_local'
@@ -984,23 +1189,52 @@ class Font_Protection_Plugin {
             )
         ";
         
-        $protected = (int)$wpdb->get_var($protected_query);
+        $protected_fonts = (int)$wpdb->get_var($protected_fonts_query);
+        
+        // NEW: Get user-protected files count
+        $user_protected_query = "
+            SELECT COUNT(p.ID)
+            FROM {$wpdb->posts} p
+            JOIN {$wpdb->postmeta} pm_protected ON p.ID = pm_protected.post_id AND pm_protected.meta_key = 'fontprotect_user_protected' AND pm_protected.meta_value = '1'
+            WHERE p.post_type = 'attachment'
+        ";
+        
+        $user_protected_count = (int)$wpdb->get_var($user_protected_query);
+        
+        // NEW: Get offloaded user-protected files count
+        $offloaded_user_protected_query = "
+            SELECT COUNT(p.ID)
+            FROM {$wpdb->posts} p
+            JOIN {$wpdb->postmeta} pm_protected ON p.ID = pm_protected.post_id AND pm_protected.meta_key = 'fontprotect_user_protected' AND pm_protected.meta_value = '1'
+            JOIN {$wpdb->postmeta} pm_offloaded ON p.ID = pm_offloaded.post_id AND pm_offloaded.meta_key = 'advmo_offloaded' AND pm_offloaded.meta_value = '1'
+            LEFT JOIN {$wpdb->postmeta} pm_provider ON p.ID = pm_provider.post_id AND pm_provider.meta_key = 'advmo_provider'
+            WHERE p.post_type = 'attachment'
+            AND (
+                pm_provider.meta_value != 'fontprotect_local'
+                OR pm_provider.meta_value IS NULL
+            )
+        ";
+        
+        $offloaded_user_protected = (int)$wpdb->get_var($offloaded_user_protected_query);
         
         // Get recent activity
         $activity = get_option('fontprotect_recent_activity', []);
         
         return [
-            'total' => $total,
-            'offloaded' => $offloaded,
-            'protected' => $protected,
+            'total' => $total_fonts,
+            'offloaded' => $offloaded_fonts,
+            'protected' => $protected_fonts,
+            'user_protected_total' => $user_protected_count,
+            'user_protected_offloaded' => $offloaded_user_protected,
             'recent_activity' => $activity
         ];
     }
     
+    
     /**
      * Fix font URL - Only modifies font files, not other media
      */
-    public function fix_font_url($url, $attachment_id) {
+    public function fix_media_url($url, $attachment_id) {
         // Skip processing if not a numeric attachment ID
         if (!is_numeric($attachment_id)) {
             return $url;
@@ -1011,21 +1245,25 @@ class Font_Protection_Plugin {
             return $this->processed_attachments[$attachment_id];
         }
         
-        // Check if this is a font file we want to process
+        // Get the file
         $file = get_attached_file($attachment_id);
         if (!$file) {
             return $url;
         }
         
+        // Check if this is a font file or user-protected file
         $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-        if (!in_array($ext, $this->font_extensions)) {
-            // Store the original URL to avoid reprocessing non-font files
+        $is_font = in_array($ext, $this->font_extensions);
+        $is_user_protected = $this->is_user_protected($attachment_id);
+        
+        if (!$is_font && !$is_user_protected) {
+            // Store the original URL to avoid reprocessing non-protected files
             $this->processed_attachments[$attachment_id] = $url;
             return $url;
         }
         
         // Check if we've protected this file
-        $protected = get_post_meta($attachment_id, 'fontprotect_protected', true);
+        $protected = $this->is_protected($attachment_id);
         if (!$protected) {
             return $url;
         }
@@ -1431,6 +1669,10 @@ class Font_Protection_Plugin {
             WHERE p.post_type = 'attachment'
             AND (
                 LOWER(SUBSTRING_INDEX(p.guid, '.', -1)) IN ({$extensions_list})
+                OR p.ID IN (
+                    SELECT post_id FROM {$wpdb->postmeta} 
+                    WHERE meta_key = 'fontprotect_user_protected' AND meta_value = '1'
+                )
             )
             AND (
                 pm_provider.meta_value != 'fontprotect_local' OR
@@ -1441,11 +1683,11 @@ class Font_Protection_Plugin {
             LIMIT {$batch_size}
         ";
         
-        $font_files = $wpdb->get_results($query);
+        $files_to_restore = $wpdb->get_results($query);
         
-        if (empty($font_files)) {
+        if (empty($files_to_restore)) {
             if ($force) {
-                $this->log('info', 'No Offloaded Fonts', 'No offloaded font files found during forced scan');
+                $this->log('info', 'No Files to Restore', 'No offloaded files found that need restoration during forced scan');
             }
             return;
         }
@@ -1453,43 +1695,43 @@ class Font_Protection_Plugin {
         $success_count = 0;
         $fail_count = 0;
         
-        // Process each font file
-        foreach ($font_files as $font_file) {
+        // Process each file
+        foreach ($files_to_restore as $file) {
             // Add to recently processed list
-            $recently_processed[$font_file->ID] = $now;
+            $recently_processed[$file->ID] = $now;
             
             // First, check if file exists locally
-            $file = get_attached_file($font_file->ID);
+            $local_file = get_attached_file($file->ID);
             
-            if (file_exists($file)) {
+            if (file_exists($local_file)) {
                 // File exists locally, just update the metadata
-                $this->update_font_metadata($font_file->ID);
+                $this->update_font_metadata($file->ID);
                 
                 // Log activity
-                $this->log('success', 'Fixed Metadata', $font_file->post_title, "Local file exists at: {$file}");
+                $this->log('success', 'Fixed Metadata', $file->post_title, "Local file exists at: {$local_file}");
                 
                 $success_count++;
             } else {
                 // File doesn't exist locally, try to download it
-                $result = $this->download_font_file($font_file);
+                $result = $this->download_font_file($file);
                 
                 if ($result === true) {
                     // Log success
-                    $this->log('success', 'Downloaded', $font_file->post_title, "Successfully downloaded to: {$file}");
+                    $this->log('success', 'Downloaded', $file->post_title, "Successfully downloaded to: {$local_file}");
                     $success_count++;
                 } else {
                     // Log failure with error details
-                    $this->log('error', 'Download Failed', $font_file->post_title, $result);
+                    $this->log('error', 'Download Failed', $file->post_title, $result);
                     $fail_count++;
                     
                     // Try alternative download method
-                    $alt_result = $this->alt_download_font_file($font_file);
+                    $alt_result = $this->alt_download_font_file($file);
                     if ($alt_result === true) {
-                        $this->log('success', 'Alt Download Success', $font_file->post_title, "Used alternative method to download to: {$file}");
+                        $this->log('success', 'Alt Download Success', $file->post_title, "Used alternative method to download to: {$local_file}");
                         $success_count++;
                         $fail_count--; // Decrement failure count since we succeeded
                     } else {
-                        $this->log('error', 'Alt Download Failed', $font_file->post_title, $alt_result);
+                        $this->log('error', 'Alt Download Failed', $file->post_title, $alt_result);
                     }
                 }
             }
@@ -1503,10 +1745,10 @@ class Font_Protection_Plugin {
             $this->log(
                 $fail_count > 0 ? 'warning' : 'success',
                 'Restore Summary',
-                'Font Files',
+                'Protected Files',
                 sprintf(
-                    "Processed %d font files. Success: %d, Failures: %d",
-                    count($font_files),
+                    "Processed %d files. Success: %d, Failures: %d",
+                    count($files_to_restore),
                     $success_count,
                     $fail_count
                 )
@@ -1517,7 +1759,7 @@ class Font_Protection_Plugin {
                 $this->send_notification_email(
                     'Font Protection: Restoration Issues',
                     sprintf(
-                        "Font Protection plugin encountered %d failures during font restoration. Please check the activity logs for details.",
+                        "Font Protection plugin encountered %d failures during file restoration. Please check the activity logs for details.",
                         $fail_count
                     )
                 );
@@ -1525,7 +1767,7 @@ class Font_Protection_Plugin {
         }
         
         return [
-            'processed' => count($font_files),
+            'processed' => count($files_to_restore),
             'success' => $success_count,
             'failed' => $fail_count
         ];
@@ -1758,7 +2000,7 @@ class Font_Protection_Plugin {
     /**
      * Prevent font files from being reoffloaded
      */
-    public function prevent_font_reoffload($should_offload, $attachment_id) {
+    public function prevent_reoffload($should_offload, $attachment_id) {
         // Check if this is a font file
         $file = get_attached_file($attachment_id);
         if (!$file) {
@@ -1766,17 +2008,21 @@ class Font_Protection_Plugin {
         }
         
         $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
-        if (in_array($ext, $this->font_extensions)) {
-            // If it's a font file, prevent offloading
+        $is_font = in_array($ext, $this->font_extensions);
+        $is_user_protected = $this->is_user_protected($attachment_id);
+        
+        if ($is_font || $is_user_protected) {
+            // If it's a protected file, prevent offloading
             if ($this->debug_mode) {
-                $this->log('info', 'Prevented Reoffload', basename($file), 'Blocked attempt to reoffload a font file');
+                $file_type = $is_font ? 'font file' : 'user-protected file';
+                $this->log('info', 'Prevented Reoffload', basename($file), "Blocked attempt to reoffload a {$file_type}");
             }
             return false;
         }
         
         return $should_offload;
     }
-    
+
     /**
      * Log activity
      */
@@ -2098,6 +2344,295 @@ class Font_Protection_Plugin {
         
         return $scan_count === 0;
     }
+
+        // NEW: Load user protected files IDs
+    public function load_user_protected_files() {
+        global $wpdb;
+        
+        $query = "
+            SELECT post_id 
+            FROM {$wpdb->postmeta} 
+            WHERE meta_key = 'fontprotect_user_protected' 
+            AND meta_value = '1'
+        ";
+        
+        $results = $wpdb->get_col($query);
+        
+        if (!empty($results)) {
+            $this->user_protected_files = array_map('intval', $results);
+        }
+    }
+
+    // NEW: Add protection field to media library
+    public function add_protection_field($form_fields, $post) {
+        // Skip if not in admin or if not an attachment
+        if (!is_admin() || $post->post_type !== 'attachment') {
+            return $form_fields;
+        }
+        
+        $is_protected = $this->is_user_protected($post->ID);
+        
+        $form_fields['fontprotect_protected'] = array(
+            'label' => __('Local Protection', 'font-protection'),
+            'input' => 'html',
+            'html' => '<label><input type="checkbox" name="attachments[' . $post->ID . '][fontprotect_protected]" value="1" ' . checked($is_protected, true, false) . ' /> ' . __('Keep file on local server', 'font-protection') . '</label>',
+            'helps' => __('Prevent this file from being offloaded to cloud storage. If already offloaded, it will be restored locally.', 'font-protection')
+        );
+        
+        return $form_fields;
+    }
+
+    // NEW: Save protection field value
+    public function save_protection_field($post, $attachment) {
+        if (isset($attachment['fontprotect_protected'])) {
+            $protected = (bool)$attachment['fontprotect_protected'];
+            
+            if ($protected) {
+                // Mark as protected
+                update_post_meta($post['ID'], 'fontprotect_user_protected', '1');
+                
+                // Add to our array
+                if (!in_array($post['ID'], $this->user_protected_files)) {
+                    $this->user_protected_files[] = (int)$post['ID'];
+                }
+                
+                // Force restore if it's offloaded
+                $this->restore_specific_file($post['ID']);
+            } else {
+                // Remove protection (but don't reoffload)
+                delete_post_meta($post['ID'], 'fontprotect_user_protected');
+                
+                // Remove from our array
+                $key = array_search($post['ID'], $this->user_protected_files);
+                if ($key !== false) {
+                    unset($this->user_protected_files[$key]);
+                }
+            }
+        }
+        
+        return $post;
+    }
+
+    // NEW: Add bulk action to protect files
+    public function add_bulk_protection_action($bulk_actions) {
+        $bulk_actions['fontprotect_protect'] = __('Protect Locally', 'font-protection');
+        $bulk_actions['fontprotect_unprotect'] = __('Remove Local Protection', 'font-protection');
+        return $bulk_actions;
+    }
+
+    // NEW: Handle bulk protection action
+    public function handle_bulk_protection_action($redirect_to, $action, $post_ids) {
+        if ($action !== 'fontprotect_protect' && $action !== 'fontprotect_unprotect') {
+            return $redirect_to;
+        }
+        
+        $protected_count = 0;
+        $unprotected_count = 0;
+        
+        foreach ($post_ids as $post_id) {
+            if ($action === 'fontprotect_protect') {
+                update_post_meta($post_id, 'fontprotect_user_protected', '1');
+                $this->restore_specific_file($post_id);
+                $protected_count++;
+            } else {
+                delete_post_meta($post_id, 'fontprotect_user_protected');
+                $unprotected_count++;
+            }
+        }
+        
+        // Reload our array of protected files
+        $this->load_user_protected_files();
+        
+        if ($action === 'fontprotect_protect') {
+            $redirect_to = add_query_arg('fontprotect_protected', $protected_count, $redirect_to);
+        } else {
+            $redirect_to = add_query_arg('fontprotect_unprotected', $unprotected_count, $redirect_to);
+        }
+        
+        return $redirect_to;
+    }
+
+    // NEW: Add protection status column to media library
+    public function add_protection_column($columns) {
+        $columns['fontprotect_status'] = __('Local Protection', 'font-protection');
+        return $columns;
+    }
+
+    // NEW: Display protection status in the column
+    public function display_protection_column($column_name, $post_id) {
+        if ($column_name !== 'fontprotect_status') {
+            return;
+        }
+        
+        $is_font = false;
+        $file = get_attached_file($post_id);
+        if ($file) {
+            $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+            $is_font = in_array($ext, $this->font_extensions);
+        }
+        
+        $is_protected = $this->is_protected($post_id);
+        $is_user_protected = $this->is_user_protected($post_id);
+        
+        if ($is_font && $is_protected) {
+            echo '<span class="fontprotect-status fontprotect-status-active">' . __('Font Protected', 'font-protection') . '</span>';
+        } elseif ($is_user_protected) {
+            echo '<span class="fontprotect-status fontprotect-status-active">' . __('User Protected', 'font-protection') . '</span>';
+        } else {
+            echo '<span class="fontprotect-status fontprotect-status-inactive">' . __('Not Protected', 'font-protection') . '</span>';
+            echo '<br><a href="#" class="fontprotect-toggle-protection" data-id="' . esc_attr($post_id) . '" data-action="protect">' . __('Protect', 'font-protection') . '</a>';
+        }
+    }
+
+    // NEW: AJAX handler for toggling protection
+    public function ajax_toggle_protection() {
+        // Check nonce
+        if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'fontprotect-admin')) {
+            wp_send_json_error([
+                'message' => __('Security check failed.', 'font-protection')
+            ]);
+        }
+        
+        // Get attachment ID
+        $attachment_id = isset($_POST['attachment_id']) ? intval($_POST['attachment_id']) : 0;
+        if (!$attachment_id) {
+            wp_send_json_error([
+                'message' => __('Invalid attachment ID.', 'font-protection')
+            ]);
+        }
+        
+        // Get action
+        $action = isset($_POST['toggle_action']) ? sanitize_text_field($_POST['toggle_action']) : '';
+        if (!in_array($action, ['protect', 'unprotect'])) {
+            wp_send_json_error([
+                'message' => __('Invalid action.', 'font-protection')
+            ]);
+        }
+        
+        if ($action === 'protect') {
+            // Mark as protected
+            update_post_meta($attachment_id, 'fontprotect_user_protected', '1');
+            
+            // Force restore if needed
+            $this->restore_specific_file($attachment_id);
+            
+            wp_send_json_success([
+                'message' => __('File is now protected and will be kept on the local server.', 'font-protection'),
+                'status' => 'protected'
+            ]);
+        } else {
+            // Remove protection
+            delete_post_meta($attachment_id, 'fontprotect_user_protected');
+            
+            wp_send_json_success([
+                'message' => __('Protection removed. File can now be offloaded.', 'font-protection'),
+                'status' => 'unprotected'
+            ]);
+        }
+    }
+
+    // NEW: AJAX handler for restoring a specific file
+    public function ajax_restore_file() {
+        // Check nonce
+        if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'fontprotect-admin')) {
+            wp_send_json_error([
+                'message' => __('Security check failed.', 'font-protection')
+            ]);
+        }
+        
+        // Get attachment ID
+        $attachment_id = isset($_POST['attachment_id']) ? intval($_POST['attachment_id']) : 0;
+        if (!$attachment_id) {
+            wp_send_json_error([
+                'message' => __('Invalid attachment ID.', 'font-protection')
+            ]);
+        }
+        
+        // Verify the attachment exists
+        $attachment = get_post($attachment_id);
+        if (!$attachment || $attachment->post_type !== 'attachment') {
+            wp_send_json_error([
+                'message' => __('Attachment not found.', 'font-protection')
+            ]);
+        }
+        
+        // Try to restore the file
+        $result = $this->restore_specific_file($attachment_id);
+        
+        if ($result) {
+            wp_send_json_success([
+                'message' => sprintf(__('File "%s" has been restored successfully.', 'font-protection'), basename(get_attached_file($attachment_id))),
+                'status' => 'restored'
+            ]);
+        } else {
+            wp_send_json_error([
+                'message' => sprintf(__('Failed to restore file "%s". Please check the logs for details.', 'font-protection'), basename(get_attached_file($attachment_id))),
+            ]);
+        }
+    }
+
+    // Utility function to check if a file is user protected
+    public function is_user_protected($attachment_id) {
+        return in_array((int)$attachment_id, $this->user_protected_files) || 
+            get_post_meta($attachment_id, 'fontprotect_user_protected', true) === '1';
+    }
+
+    // Utility function to check if a file is protected (either font or user-selected)
+    public function is_protected($attachment_id) {
+        return get_post_meta($attachment_id, 'fontprotect_protected', true) || 
+            $this->is_user_protected($attachment_id);
+    }
+
+    // NEW: Restore a specific file
+    public function restore_specific_file($attachment_id) {
+        $file = get_attached_file($attachment_id);
+        if (!$file) {
+            return false;
+        }
+        
+        // Check if it's already offloaded
+        $is_offloaded = get_post_meta($attachment_id, 'advmo_offloaded', true) === '1';
+        
+        if (!$is_offloaded) {
+            // Not offloaded, just mark as protected
+            update_post_meta($attachment_id, 'fontprotect_protected', time());
+            return true;
+        }
+        
+        // Get provider info
+        $provider = get_post_meta($attachment_id, 'advmo_provider', true);
+        $bucket = get_post_meta($attachment_id, 'advmo_bucket', true);
+        $path = get_post_meta($attachment_id, 'advmo_path', true);
+        
+        // Create a font file object for the download function
+        $file_object = (object)[
+            'ID' => $attachment_id,
+            'post_title' => get_the_title($attachment_id),
+            'guid' => get_post_meta($attachment_id, 'advmo_orig_guid', true) ?: get_the_guid($attachment_id),
+            'provider' => $provider,
+            'bucket' => $bucket,
+            'path' => $path
+        ];
+        
+        // Try to download
+        $result = $this->download_font_file($file_object);
+        
+        if ($result === true) {
+            $this->log('success', 'User Protected Download', $file_object->post_title, "Successfully downloaded to: {$file}");
+            return true;
+        } else {
+            // Try alternative method
+            $alt_result = $this->alt_download_font_file($file_object);
+            if ($alt_result === true) {
+                $this->log('success', 'User Protected Alt Download', $file_object->post_title, "Used alternative method to download to: {$file}");
+                return true;
+            } else {
+                $this->log('error', 'User Protected Download Failed', $file_object->post_title, $alt_result);
+                return false;
+            }
+        }
+    }
+
 }
 
 // Initialize the plugin
