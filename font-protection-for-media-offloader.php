@@ -680,17 +680,43 @@ class Font_Protection_Plugin {
                             $file_path = get_attached_file($file->ID);
                             $file_type = wp_check_filetype(basename($file_path))['ext'];
                             $is_image = wp_attachment_is_image($file->ID);
-                            $thumbnail = $is_image ? wp_get_attachment_image($file->ID, [50, 50]) : '';
+                            
+                            // Improved thumbnail display
+                            $thumbnail = '';
+                            if ($is_image) {
+                                // Try getting the thumbnail URL directly
+                                $thumb_url = wp_get_attachment_thumb_url($file->ID);
+                                if ($thumb_url) {
+                                    $thumbnail = '<img src="' . esc_url($thumb_url) . '" width="50" height="50" alt="' . esc_attr(basename($file_path)) . '" style="vertical-align: middle;" />';
+                                } else {
+                                    // Fallback to full image with resize
+                                    $thumbnail = '<img src="' . esc_url($file_url) . '" width="50" height="50" alt="' . esc_attr(basename($file_path)) . '" style="vertical-align: middle; object-fit: cover;" />';
+                                }
+                            } else {
+                                // For non-images, show an icon based on file type
+                                $icon_class = 'dashicons-media-default';
+                                if (strpos($file->post_mime_type, 'audio') !== false) {
+                                    $icon_class = 'dashicons-media-audio';
+                                } else if (strpos($file->post_mime_type, 'video') !== false) {
+                                    $icon_class = 'dashicons-media-video';
+                                } else if ($file_type == 'pdf') {
+                                    $icon_class = 'dashicons-pdf';
+                                } else if (in_array($file_type, ['doc', 'docx'])) {
+                                    $icon_class = 'dashicons-media-document';
+                                } else if (in_array($file_type, $this->font_extensions)) {
+                                    $icon_class = 'dashicons-editor-textcolor';
+                                }
+                                $thumbnail = '<span class="dashicons ' . $icon_class . '" style="font-size: 40px; width: 40px; height: 40px; vertical-align: middle;"></span>';
+                            }
+                            
                             $status = file_exists($file_path) ? 'protected' : 'missing';
                             $status_text = $status === 'protected' ? __('Protected', 'font-protection') : __('Missing', 'font-protection');
                             $status_class = $status === 'protected' ? 'fontprotect-status-active' : 'fontprotect-status-inactive';
                             ?>
                             <tr>
                                 <td>
-                                    <?php if ($thumbnail): ?>
-                                        <?php echo $thumbnail; ?>
-                                    <?php endif; ?>
-                                    <strong><?php echo esc_html(basename($file_path)); ?></strong>
+                                    <?php echo $thumbnail; ?>
+                                    <strong style="vertical-align: middle; margin-left: 10px;"><?php echo esc_html(basename($file_path)); ?></strong>
                                 </td>
                                 <td><?php echo strtoupper($file_type); ?></td>
                                 <td><?php echo get_the_date('', $file->ID); ?></td>
@@ -2024,6 +2050,77 @@ class Font_Protection_Plugin {
     }
 
     /**
+     * Restore a file to its original offloaded state with added safeguards
+     */
+    public function restore_original_provider($attachment_id) {
+        // Get the original provider and other metadata
+        $original_provider = get_post_meta($attachment_id, 'fontprotect_original_provider', true);
+        $original_bucket = get_post_meta($attachment_id, 'fontprotect_original_bucket', true);
+        $original_path = get_post_meta($attachment_id, 'fontprotect_original_path', true);
+        $file_name = basename(get_attached_file($attachment_id));
+        
+        // Only restore if we have the original provider
+        if ($original_provider) {
+            // SAFEGUARD: Backup current metadata state before changing anything
+            $current_state = [
+                'provider' => get_post_meta($attachment_id, 'advmo_provider', true),
+                'bucket' => get_post_meta($attachment_id, 'advmo_bucket', true),
+                'path' => get_post_meta($attachment_id, 'advmo_path', true),
+                'offloaded' => get_post_meta($attachment_id, 'advmo_offloaded', true),
+                'timestamp' => time()
+            ];
+            update_post_meta($attachment_id, 'fontprotect_previous_state', $current_state);
+            
+            // Log the backup creation
+            $this->log('info', 'Created Backup', $file_name, "Saved current metadata state before unprotecting");
+            
+            // Restore original provider metadata
+            update_post_meta($attachment_id, 'advmo_provider', $original_provider);
+            
+            if ($original_bucket) {
+                update_post_meta($attachment_id, 'advmo_bucket', $original_bucket);
+            }
+            
+            if ($original_path) {
+                update_post_meta($attachment_id, 'advmo_path', $original_path);
+            }
+            
+            // Make sure the file is marked as offloaded
+            update_post_meta($attachment_id, 'advmo_offloaded', '1');
+            
+            // Remove our protection flag
+            delete_post_meta($attachment_id, 'fontprotect_protected');
+            
+            // Clear any URL caches
+            $transient_key = 'advmo_url_' . $attachment_id;
+            delete_transient($transient_key);
+            
+            // Clear cached URLs from our internal array
+            if (isset($this->processed_attachments[$attachment_id])) {
+                unset($this->processed_attachments[$attachment_id]);
+            }
+            
+            // Update attachment metadata to trigger URL updates
+            $meta = wp_get_attachment_metadata($attachment_id);
+            if ($meta) {
+                wp_update_attachment_metadata($attachment_id, $meta);
+            }
+            
+            // Let the offload plugin handle file management
+            // This ensures WordPress media library continues to function correctly
+            
+            // SAFEGUARD: Refresh WordPress attachment cache
+            clean_attachment_cache($attachment_id);
+            
+            $this->log('success', 'Restored Provider', $file_name, "Restored original provider: {$original_provider}");
+            
+            return true;
+        }
+        
+        return false;
+    }
+
+    /**
      * Log activity
      */
     public function log($level, $action, $file, $details = '') {
@@ -2386,8 +2483,9 @@ class Font_Protection_Plugin {
     public function save_protection_field($post, $attachment) {
         if (isset($attachment['fontprotect_protected'])) {
             $protected = (bool)$attachment['fontprotect_protected'];
+            $was_protected = $this->is_user_protected($post['ID']);
             
-            if ($protected) {
+            if ($protected && !$was_protected) {
                 // Mark as protected
                 update_post_meta($post['ID'], 'fontprotect_user_protected', '1');
                 
@@ -2398,8 +2496,14 @@ class Font_Protection_Plugin {
                 
                 // Force restore if it's offloaded
                 $this->restore_specific_file($post['ID']);
-            } else {
-                // Remove protection (but don't reoffload)
+                
+                // Log the action
+                $this->log('success', 'User Protected', basename(get_attached_file($post['ID'])), 'File marked as protected via media library form');
+            } else if (!$protected && $was_protected) {
+                // Log the action before removing protection
+                $this->log('info', 'User Unprotected', basename(get_attached_file($post['ID'])), 'Protection removed via media library form');
+                
+                // Remove protection
                 delete_post_meta($post['ID'], 'fontprotect_user_protected');
                 
                 // Remove from our array
@@ -2407,6 +2511,9 @@ class Font_Protection_Plugin {
                 if ($key !== false) {
                     unset($this->user_protected_files[$key]);
                 }
+                
+                // Restore original provider and URL
+                $this->restore_original_provider($post['ID']);
             }
         }
         
@@ -2516,21 +2623,36 @@ class Font_Protection_Plugin {
             // Force restore if needed
             $this->restore_specific_file($attachment_id);
             
+            // Log the protection action
+            $this->log('success', 'User Protected', basename(get_attached_file($attachment_id)), 'File marked as protected by user');
+            
             wp_send_json_success([
                 'message' => __('File is now protected and will be kept on the local server.', 'font-protection'),
                 'status' => 'protected'
             ]);
         } else {
+            // Log the unprotection action
+            $this->log('info', 'User Unprotected', basename(get_attached_file($attachment_id)), 'Protection removed by user');
+            
             // Remove protection
             delete_post_meta($attachment_id, 'fontprotect_user_protected');
             
+            // Remove from our protected array
+            $key = array_search($attachment_id, $this->user_protected_files);
+            if ($key !== false) {
+                unset($this->user_protected_files[$key]);
+            }
+            
+            // Restore original provider and URL
+            $this->restore_original_provider($attachment_id);
+            
             wp_send_json_success([
-                'message' => __('Protection removed. File can now be offloaded.', 'font-protection'),
+                'message' => __('Protection removed. File will return to its original offloaded state.', 'font-protection'),
                 'status' => 'unprotected'
             ]);
         }
     }
-
+    
     // NEW: AJAX handler for restoring a specific file
     public function ajax_restore_file() {
         // Check nonce
